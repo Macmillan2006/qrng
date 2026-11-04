@@ -1,0 +1,126 @@
+import math
+import os
+import time
+import perceval as pcvl
+from perceval.algorithm import Sampler
+
+API_TOKEN = "your api token"   # replace with your actual token
+PLATFORM_NAME = "sim:ascella"              # confirmed working simulator
+CHUNK_SIZE = 200_000                      # smaller chunks — remote calls are metered/slower than local
+TARGET_RAW_BITS = 10_000_000              # change as needed
+OUTPUT_FILE = "quandela_bits_phase_shifter.txt"
+MAX_RETRIES = 5                           # retries per chunk on transient failures
+
+# Phase shift applied between the two beam splitters, in radians.
+# pi/2 gives an exact 50/50 output split for this Mach-Zehnder layout
+# (verified locally: |1,0> and |0,1> each come out at probability 0.5).
+PHASE_SHIFT = math.pi / 2
+
+
+def build_remote_processor():
+    # Mach-Zehnder interferometer: BS -> phase shifter (on mode 0) -> BS.
+    # Instead of relying on a single beam splitter's reflectivity to be
+    # exactly 50/50, this uses the phase shifter to control the split ratio
+    # between the two arms of the interferometer.
+    circuit = (
+        pcvl.Circuit(2)
+        // pcvl.BS()
+        // (0, pcvl.PS(phi=PHASE_SHIFT))
+        // pcvl.BS()
+    )
+    processor = pcvl.RemoteProcessor(PLATFORM_NAME, API_TOKEN)
+    processor.set_circuit(circuit)
+    processor.with_input(pcvl.BasicState([1, 0]))
+    # Remote processors require an explicit threshold for how many photons
+    # must be detected for an outcome to count. We send in 1 photon and
+    # expect to detect it, so require exactly 1.
+    processor.min_detected_photons_filter(1)
+    return processor
+
+
+def sample_to_bit(sample_state):
+    state_str = str(sample_state)
+    if state_str == "|1,0>":
+        return 0
+    elif state_str == "|0,1>":
+        return 1
+    return None
+
+
+def run_chunk(sampler, chunk_size, poll_interval=1.0, max_retries=MAX_RETRIES):
+    """Submit an async job for chunk_size samples, wait for completion, return raw states.
+    Retries on transient failures (e.g. get_results() briefly returning None
+    right after job completion, or dropped connections)."""
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            remote_job = sampler.samples.execute_async(chunk_size)
+            while not remote_job.is_complete:
+                time.sleep(poll_interval)
+            status = remote_job.status()
+            if str(status) not in ("SUCCESS", "JobStatus.SUCCESS"):
+                raise RuntimeError(f"Remote job did not succeed, status={status}")
+            results = remote_job.get_results()
+            if not results or "results" not in results:
+                raise RuntimeError(f"get_results() returned unusable data: {results!r}")
+            return results["results"]
+        except Exception as e:
+            last_error = e
+            wait = min(2 ** attempt, 30)
+            print(f"  [chunk attempt {attempt}/{max_retries} failed: {e} "
+                  f"— retrying in {wait}s]")
+            time.sleep(wait)
+    raise RuntimeError(f"Chunk failed after {max_retries} attempts: {last_error}")
+
+
+def load_existing_bits(path):
+    """Resume support: if an output file already exists, pick up where it left off
+    instead of regenerating bits (and burning cloud quota) from scratch."""
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        content = f.read().strip()
+    return [int(c) for c in content if c in ("0", "1")]
+
+
+def generate_raw_bits(target_count):
+    raw_bits = load_existing_bits(OUTPUT_FILE)
+    if raw_bits:
+        print(f"Resuming from existing {OUTPUT_FILE}: {len(raw_bits):,} bits already collected.")
+
+    if len(raw_bits) >= target_count:
+        print("Target already reached in existing file — nothing to do.")
+        return raw_bits[:target_count]
+
+    processor = build_remote_processor()
+    # Quandela requires an explicit upper bound on shots per call for remote
+    # processors, so you can't accidentally burn unbounded credits.
+    sampler = Sampler(processor, max_shots_per_call=CHUNK_SIZE * 10)
+
+    print(f"Generating ~{target_count:,} raw bits via Quandela Cloud "
+          f"({PLATFORM_NAME}), Mach-Zehnder circuit (phase shift={PHASE_SHIFT:.4f} rad), "
+          f"chunks of {CHUNK_SIZE:,}...")
+
+    while len(raw_bits) < target_count:
+        outcomes = run_chunk(sampler, CHUNK_SIZE)
+        for state in outcomes:
+            bit = sample_to_bit(state)
+            if bit is not None:
+                raw_bits.append(bit)
+        print(f"  ...{len(raw_bits):,} raw bits collected")
+        # Checkpoint after every chunk so a crash/interruption doesn't lose everything
+        with open(OUTPUT_FILE, "w") as f:
+            f.write("".join(map(str, raw_bits)))
+
+    return raw_bits[:target_count]
+
+
+if __name__ == "__main__":
+    bits = generate_raw_bits(TARGET_RAW_BITS)
+    print(f"\nGenerated {len(bits):,} raw bits via Quandela Cloud.")
+    print("Sample (first 32 bits):", "".join(map(str, bits[:32])))
+
+    with open(OUTPUT_FILE, "w") as f:
+        f.write("".join(map(str, bits)))
+    print(f"Saved {len(bits):,} raw bits to {OUTPUT_FILE}")
+    print(f"Run whiten_bits.py (update RAW_FILE to {OUTPUT_FILE}) next to debias this file.")
